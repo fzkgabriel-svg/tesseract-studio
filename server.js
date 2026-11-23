@@ -1,7 +1,9 @@
-// Tesseract Studio — serveur officiel.
+// Kaeloryn Studio — serveur officiel.
 // Node.js natif : HTTP + SQLite (node:sqlite) + crypto (scrypt, sessions).
 // Aucune dépendance externe. Lancement : node server.js [port]
 import http from 'node:http';
+import net from 'node:net';
+import tls from 'node:tls';
 import { readFileSync, writeFileSync, existsSync, statSync, createReadStream, mkdirSync, readdirSync } from 'node:fs';
 import { join, extname, normalize } from 'node:path';
 import { dirname } from 'node:path';
@@ -10,6 +12,17 @@ import crypto from 'node:crypto';
 import { db, q } from './db.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
+
+// .env local (site/.env) : SMTP_URL=..., MAIL_FROM=..., ADMIN_*=...
+// les variables déjà définies dans l'environnement priment
+try {
+  const envFile = join(ROOT, '.env');
+  if (existsSync(envFile)) for (const line of readFileSync(envFile, 'utf8').split(/\r?\n/)) {
+    const m = /^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*)\s*$/.exec(line);
+    if (m && !line.trim().startsWith('#') && process.env[m[1]] === undefined)
+      process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
+  }
+} catch (e) { /* .env absent ou illisible : ignoré */ }
 const PUB = join(ROOT, 'public');
 const DATA = join(ROOT, 'data');
 const PORT = parseInt(process.argv[2] || process.env.PORT || '8080', 10);
@@ -93,11 +106,97 @@ function useToken(tok, kind) {
   if (!t || t.kind !== kind || t.used || t.expires_at < new Date().toISOString()) return null;
   q.useToken.run(tok); return t;
 }
+// ---------- envoi d'e-mails : client SMTP minimal (node:net/tls, zéro dépendance) ----------
+// SMTP_URL=smtps://user:pass@hote:465  (TLS implicite — recommandé)
+// SMTP_URL=smtp://user:pass@hote:25    (clair ; STARTTLS non géré)
+// MAIL_FROM="Kaeloryn Studio <no-reply@domaine>" pour l'expéditeur.
+const MAIL_FROM = process.env.MAIL_FROM || 'Kaeloryn Studio <no-reply@kaeloryn.studio>';
+let smtpCfg = null;
+try {
+  if (process.env.SMTP_URL) {
+    const u = new URL(process.env.SMTP_URL);
+    smtpCfg = {
+      secure: u.protocol === 'smtps:',
+      user: decodeURIComponent(u.username || ''),
+      pass: decodeURIComponent(u.password || ''),
+      host: u.hostname, port: +(u.port || (u.protocol === 'smtps:' ? 465 : 25)),
+    };
+  }
+} catch (e) { console.error('[smtp] SMTP_URL invalide :', e.message); }
+
+function smtpSend({ to, subject, html }) {
+  return new Promise((resolve, reject) => {
+    const sock = smtpCfg.secure
+      ? tls.connect(smtpCfg.port, smtpCfg.host, { servername: smtpCfg.host })
+      : net.connect(smtpCfg.port, smtpCfg.host);
+    sock.setTimeout(15000, () => sock.destroy(new Error('délai SMTP dépassé')));
+    let buf = '', waiter = null, done = false;
+    const finish = (err, r) => { if (!done) { done = true; try { sock.destroy(); } catch (e) {} err ? reject(err) : resolve(r); } };
+    sock.on('error', finish);
+    sock.on('data', d => {
+      buf += d.toString('utf8');
+      let i;
+      while ((i = buf.indexOf('\r\n')) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (waiter && waiter.re.test(line)) { const w = waiter; waiter = null; w.ok(line); }
+      }
+    });
+    // attend une réponse définitive "CODE " (les lignes "CODE-" d'un multiline sont ignorées)
+    const waitAny = () => new Promise(ok => { waiter = { re: /^[0-9]{3} /, ok }; });
+    const cmd = async (line, code) => {
+      sock.write(line + '\r\n');
+      const r = await waitAny();
+      if (r.slice(0, 3) !== code) throw new Error(`SMTP ${code} attendu après « ${line.slice(0, 60)} », reçu : ${r.slice(0, 140)}`);
+      return r;
+    };
+    const b64 = s => Buffer.from(s, 'utf8').toString('base64');
+    (async () => {
+      const greet = await waitAny();
+      if (!greet.startsWith('220')) throw new Error('SMTP : ' + greet.slice(0, 140));
+      await cmd('EHLO kaeloryn.studio', '250');
+      if (smtpCfg.user) {
+        await cmd('AUTH LOGIN', '334');
+        await cmd(b64(smtpCfg.user), '334');
+        await cmd(b64(smtpCfg.pass), '235');
+      }
+      const mailFrom = MAIL_FROM.match(/<([^>]+)>/)?.[1] || (MAIL_FROM.includes('@') ? MAIL_FROM.trim() : 'no-reply@kaeloryn.studio');
+      await cmd(`MAIL FROM:<${mailFrom}>`, '250');
+      await cmd(`RCPT TO:<${to}>`, '250');
+      await cmd('DATA', '354');
+      const enc = s => '=?UTF-8?B?' + Buffer.from(s, 'utf8').toString('base64') + '?=';
+      const msg = [
+        `From: ${MAIL_FROM}`, `To: ${to}`, `Subject: ${enc(subject)}`,
+        'MIME-Version: 1.0', 'Content-Type: text/html; charset=utf-8',
+        'Content-Transfer-Encoding: base64', '', Buffer.from(html, 'utf8').toString('base64'), '.',
+      ].join('\r\n');
+      sock.write(msg + '\r\n');
+      const r = await waitAny();
+      if (r.slice(0, 3) !== '250') throw new Error('SMTP DATA refusé : ' + r.slice(0, 140));
+      try { sock.write('QUIT\r\n'); } catch (e) {}
+      finish(null, true);
+    })().catch(finish);
+  });
+}
+
 // sans SMTP configuré : le lien est journalisé (mode dev) — jamais affiché en prod
 const mailNote = (kind, email, link) => {
   const tag = kind === 'verify' ? 'Vérification email' : 'Réinitialisation mot de passe';
-  if (process.env.SMTP_URL) { /* intégration SMTP réelle à brancher ici */ }
-  if (DEV) console.log(`[mail:dev] ${tag} -> ${email}\n  ${link}`);
+  const html = `<div style="font-family:sans-serif;max-width:480px;margin:auto">
+    <h2 style="color:#d4b062">${tag} — Kaeloryn Studio</h2>
+    <p>Bonjour,</p>
+    <p>Cliquez sur le bouton ci-dessous pour ${kind === 'verify' ? 'vérifier votre adresse e-mail' : 'réinitialiser votre mot de passe'} :</p>
+    <p style="text-align:center;margin:26px 0"><a href="${link}" style="background:#d4b062;color:#16130c;
+      padding:12px 26px;border-radius:8px;text-decoration:none;font-weight:bold">${kind === 'verify' ? 'VÉRIFIER MON E-MAIL' : 'RÉINITIALISER'}</a></p>
+    <p style="color:#888;font-size:12px">Ou copiez ce lien :<br><a href="${link}">${link}</a></p>
+    <p style="color:#888;font-size:12px">Ce lien expire dans 24 h. Si vous n'êtes pas à l'origine de cette demande, ignorez cet e-mail.</p>
+  </div>`;
+  if (smtpCfg) {
+    smtpSend({ to: email, subject: `${tag} — Kaeloryn Studio`, html })
+      .then(() => console.log(`[smtp] ${tag} envoyé à ${email}`))
+      .catch(e => console.error(`[smtp] échec ${tag} → ${email} :`, e.message));
+  } else if (DEV) {
+    console.log(`[mail:dev] ${tag} -> ${email}\n  ${link}`);
+  }
 };
 
 // ---------- API ----------
@@ -169,8 +268,9 @@ route('POST', '/api/forgot', async (req, res, b) => {
   const ip = clientIp(req);
   if (!rateLimit('forgot:' + ip, 5, 3600e3)) return json(res, 429, { error: 'Trop de demandes' });
   const u = q.userByEmail.get(clean(b.email).toLowerCase());
+  let tok;
   if (u) {
-    const tok = makeToken(u.id, 'reset', 1);
+    tok = makeToken(u.id, 'reset', 1);
     mailNote('reset', u.email, `http://localhost:${PORT}/account.html?reset=${tok}`);
   }
   await new Promise(r => setTimeout(r, 100));
@@ -192,6 +292,17 @@ route('GET', '/api/verify', (req, res) => {
   q.setVerified.run(t.user_id);
   send(res, 200, '<h1 style="font-family:sans-serif">E-mail vérifié ! Vous pouvez fermer cette page.</h1>', 'text/html; charset=utf-8');
 });
+
+// renvoi de l'e-mail de vérification (réservé aux comptes non vérifiés)
+route('POST', '/api/resend-verify', needAuth(async (req, res, b, s) => {
+  const ip = clientIp(req);
+  if (!rateLimit('rverify:' + s.id, 3, 3600e3)) return json(res, 429, { error: 'Trop de renvois — réessayez plus tard' });
+  const u = q.userById.get(s.id);
+  if (u.verified) return json(res, 400, { error: 'E-mail déjà vérifié' });
+  const tok = makeToken(s.id, 'verify', 24);
+  mailNote('verify', u.email, `http://localhost:${PORT}/account.html?verify=${tok}`);
+  json(res, 200, { ok: true, devToken: DEV ? tok : undefined });
+}));
 
 route('GET', '/api/news', (req, res) => {
   const list = q.allNews.all().map(n => ({ ...n, image: n.image || null }));
@@ -302,11 +413,158 @@ route('GET', '/download/:file', (req, res) => {
   createReadStream(path).pipe(res);
 });
 
+// ---------- JEU : authentification par token + sauvegarde cloud + classement ----------
+// Le jeu tourne sur une autre origine (localhost:8000) : authentification par
+// Authorization: Bearer <session token> et CORS restreint à cette origine.
+// origines du jeu autorisées à appeler l'API : local (python http.server)
+// et version en ligne (Netlify). Séparées par des virgules via GAME_ORIGINS.
+const GAME_ORIGINS = (process.env.GAME_ORIGINS ||
+  'http://localhost:8000,https://unwardened.netlify.app').split(',').map(s => s.trim());
+function gameCors(res, origin) {
+  // sans Origin (curl, même site) ou origine connue → on répond ; sinon on bloque
+  if (!origin || GAME_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin || GAME_ORIGINS[0]);
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
+    res.setHeader('Vary', 'Origin');
+  }
+}
+function getGameSession(req) {
+  const m = /^Bearer ([a-f0-9]{64})$/.exec(req.headers.authorization || '');
+  if (!m) return null;
+  const s = q.sessByToken.get(m[1]);
+  if (!s || s.expires_at < new Date().toISOString() || s.suspended) return null;
+  return s;
+}
+const needGame = fn => (req, res, b) => {
+  const s = getGameSession(req);
+  return s ? fn(req, res, b, s) : json(res, 401, { error: 'Connexion jeu requise' });
+};
+
+route('POST', '/api/game/login', async (req, res, b) => {
+  const ip = clientIp(req);
+  if (!rateLimit('glogin:' + ip, 10, 600e3)) return json(res, 429, { error: 'Trop de tentatives — réessayez plus tard' });
+  const pseudo = clean(b.pseudo || b.email), pass = b.password;
+  const u = q.userByPseudo.get(pseudo) || q.userByEmail.get(clean(pseudo).toLowerCase());
+  const okPass = u && verifyPass(pass, u.pass);
+  await new Promise(r => setTimeout(r, 120));
+  if (!u || !okPass) return json(res, 401, { error: 'Identifiants incorrects' });
+  if (u.suspended) return json(res, 403, { error: 'Ce compte est suspendu' });
+  // session SANS cookie : le jeu garde le token en localStorage
+  const token = crypto.randomBytes(32).toString('hex');
+  q.insSession.run(token, u.id, new Date(Date.now() + SESSION_DAYS * 864e5).toISOString());
+  json(res, 200, { ok: true, token, user: pubUser(q.userById.get(u.id)) });
+});
+
+route('POST', '/api/game/logout', needGame((req, res, b, s) => {
+  const m = /^Bearer ([a-f0-9]{64})$/.exec(req.headers.authorization || '');
+  if (m) q.delSession.run(m[1]);
+  json(res, 200, { ok: true });
+}));
+
+// ---------- score officiel : calculé côté serveur depuis les stats brutes ----------
+// Le client envoie des compteurs ; le serveur borne chaque valeur puis applique
+// une formule fixe. Le score n'est JAMAIS fourni par le client.
+function computeScore(st) {
+  const lvl = Math.min(200, Math.max(1, Math.floor(+st.level) || 1));
+  const worlds = Math.min(6, Math.max(0, Math.floor(+st.worldsDone) || 0));
+  const bosses = Math.min(60, Math.max(0, Math.floor(+st.bosses) || 0));
+  const achv = Math.min(100, Math.max(0, Math.floor(+st.achievements) || 0));
+  const playMin = Math.min(20000, Math.max(0, Math.floor((+st.playtime || 0) / 60)));
+  return {
+    level: lvl, worlds_done: worlds, bosses, achievements: achv, playtime: playMin * 60,
+    score: lvl * 100 + worlds * 5000 + bosses * 800 + achv * 300 + playMin * 2
+  };
+}
+
+route('GET', '/api/game/save', needGame((req, res, b, s) => {
+  const sv = q.saveByUser.get(s.id);
+  if (!sv) return json(res, 404, { error: 'Aucune sauvegarde cloud' });
+  let payload = null;
+  try { payload = JSON.parse(sv.payload); } catch (e) {}
+  json(res, 200, { version: sv.version, updated_at: sv.updated_at, payload });
+}));
+
+route('PUT', '/api/game/save', needGame((req, res, b, s) => {
+  const ip = clientIp(req);
+  if (!rateLimit('gsave:' + s.id, 30, 600e3)) return json(res, 429, { error: 'Synchronisation trop fréquente' });
+  const payload = b.payload;
+  if (!payload || typeof payload !== 'object') return json(res, 400, { error: 'Payload invalide' });
+  const raw = JSON.stringify(payload);
+  if (raw.length > 400000) return json(res, 413, { error: 'Sauvegarde trop volumineuse' });
+  const baseVersion = Math.floor(+b.baseVersion) || 0;
+  const sv = q.saveByUser.get(s.id);
+  const curVersion = sv ? sv.version : 0;
+  // gestion de conflit : le client DOIT fournir la version qu'il a lue.
+  // Si les versions divergent, on refuse et on renvoie la version serveur —
+  // le client décide (écraser / fusionner / garder le local).
+  if (baseVersion !== curVersion) {
+    return json(res, 409, { conflict: true, version: curVersion,
+      updated_at: sv ? sv.updated_at : null, hasSave: !!sv });
+  }
+  q.insSave.run(s.id, raw);
+  // stats publiques : extraites du payload (stats du jeu), score recalculé serveur
+  const st = (payload.stats && typeof payload.stats === 'object') ? payload.stats : {};
+  const sc = computeScore(st);
+  q.upsertStats.run(s.id, sc.level, sc.worlds_done, sc.bosses, sc.achievements, sc.playtime, sc.score);
+  json(res, 200, { ok: true, version: curVersion + 1 });
+}));
+
+// ---------- classement public ----------
+route('GET', '/api/leaderboard', (req, res, b, s, m) => {
+  const u = new URL(req.url, `http://${req.headers.host}`);
+  const qstr = clean(u.searchParams.get('q'));
+  if (qstr) {
+    const like = '%' + qstr.replace(/[\\%_]/g, c => '\\' + c) + '%';
+    return json(res, 200, { players: q.searchLeaderboard.all(like) });
+  }
+  const limit = Math.min(100, Math.max(1, Math.floor(+u.searchParams.get('limit')) || 50));
+  const offset = Math.max(0, Math.floor(+u.searchParams.get('offset')) || 0);
+  const players = q.leaderboard.all(limit, offset);
+  const total = q.countLeaderboard.get().c;
+  // rang du joueur connecté (si token fourni) même hors page affichée
+  let me = null;
+  const gs = getGameSession(req);
+  if (gs) {
+    const row = q.statsByUser.get(gs.id);
+    if (row && row.score > 0) {
+      const above = db.prepare('SELECT COUNT(*) c FROM player_stats ps JOIN users u ON u.id=ps.user_id WHERE u.suspended=0 AND ps.score > ?').get(row.score).c;
+      me = { rank: above + 1, score: row.score, level: row.level, worlds_done: row.worlds_done };
+    }
+  }
+  json(res, 200, { players, total, limit, offset, me });
+});
+
+// profil public : aucune donnée privée (pas d'email)
+route('GET', '/api/player/:pseudo', (req, res, b, s, m) => {
+  const st = q.publicStats.get(decodeURIComponent(m[1]));
+  if (!st) return json(res, 404, { error: 'Joueur introuvable' });
+  const rank = st.score > 0
+    ? db.prepare(`SELECT COUNT(*) c FROM player_stats ps JOIN users u ON u.id = ps.user_id
+                  WHERE u.suspended = 0 AND ps.score > ?`).get(st.score).c + 1
+    : null;
+  json(res, 200, { player: {
+    pseudo: st.pseudo, avatar: st.avatar ? `/avatar/${st.avatar}` : null,
+    score: st.score, level: st.level, worlds_done: st.worlds_done,
+    bosses: st.bosses, achievements: st.achievements,
+    playtime: st.playtime, updated_at: st.updated_at, member_since: st.created_at,
+    rank
+  }});
+});
+
 // ---------- dispatch ----------
 const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, `http://${req.headers.host}`);
     const pathname = decodeURIComponent(u.pathname);
+    // CORS pour les routes consommées par le jeu (autre origine) :
+    // préflight OPTIONS + en-têtes sur les réponses
+    const isGameApi = pathname.startsWith('/api/game/') || pathname === '/api/leaderboard'
+      || pathname.startsWith('/api/player/');
+    if (isGameApi) {
+      gameCors(res, req.headers.origin);
+      if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+    }
     if (pathname.startsWith('/api/') || pathname.startsWith('/download/')) {
       for (const r of routes) {
         const m = pathname.match(new RegExp('^' + r.p.replace(/:[^/]+/g, '([^/]+)') + '$'));
@@ -326,14 +584,17 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === '/sitemap.xml') {
       const host = req.headers.host || 'localhost';
-      const pages = ['/', '/game.html', '/news.html', '/community.html', '/account.html'];
+      const pages = ['/', '/game.html', '/news.html', '/classement.html', '/community.html', '/account.html'];
       const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n` +
         pages.map((p, i) => `  <url><loc>https://${host}${p}</loc><priority>${(1 - i * 0.1).toFixed(1)}</priority></url>`).join('\n') +
         `\n</urlset>\n`;
       return send(res, 200, xml, 'application/xml; charset=utf-8');
     }
-    // fichiers statiques
-    let fp = pathname === '/' ? '/index.html' : pathname;
+    // URLs propres : /classement et /joueur/<pseudo> → pages statiques
+    let fp;
+    if (pathname === '/classement') fp = '/classement.html';
+    else if (/^\/joueur\/[^/]+\/?$/.test(pathname)) fp = '/joueur.html';
+    else fp = pathname === '/' ? '/index.html' : pathname;
     fp = normalize(fp).replace(/\\/g, '/');
     if (fp.startsWith('/avatar/')) fp = join('/data/avatars', fp.slice(8));
     else if (fp.startsWith('/newsimg/')) fp = join('/data/news', fp.slice(9));
@@ -382,4 +643,4 @@ function seed() {
 }
 seed();
 
-server.listen(PORT, () => console.log(`Tesseract Studio — http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`Kaeloryn Studio — http://localhost:${PORT}`));

@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mon Compte — Tesseract Studio</title>
+<title>Mon Compte — Kaeloryn Studio</title>
 <link rel="stylesheet" href="/css/site.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><path d='M32 4 54 18v28L32 60 10 46V18Z' fill='none' stroke='%23d4b062' stroke-width='4'/></svg>">
 </head>
@@ -10,7 +10,7 @@
 <canvas id="fx"></canvas>
 <header class="site"><nav class="top">
   <a class="brand" href="/"><span id="logo"></span>
-    <span class="t">TESSERACT<small>STUDIO</small></span></a>
+    <span class="t">KAELORYN<small>STUDIO</small></span></a>
   <div class="links" id="navlinks"></div>
   <div id="navauth" style="display:flex;gap:8px"></div>
 </nav></header>
@@ -20,7 +20,7 @@
 <div class="auth-wrap" id="authview">
   <div class="panel">
     <h2 id="authtitle">CONNEXION</h2>
-    <div class="sub" id="authsub">Accédez à votre espace de Tesseractien.</div>
+    <div class="sub" id="authsub">Accédez à votre espace de Kaelorien.</div>
     <form id="authform">
       <label class="f" id="lbPseudo">Pseudo</label>
       <input type="text" id="fPseudo" autocomplete="username" placeholder="Votre pseudo">
@@ -43,7 +43,7 @@
 
 <!-- ===== VUE TABLEAU DE BORD ===== -->
 <div class="hidden" id="dashview">
-  <section style="padding-top:30px"><div class="sec-head"><h2>ESPACE TESSERACTIEN</h2>
+  <section style="padding-top:30px"><div class="sec-head"><h2>ESPACE KAELORIEN</h2>
     <div class="orn">✦ ✦ ✦</div></div>
   <div class="dash">
     <div>
@@ -54,6 +54,11 @@
         <div class="dl-row" style="margin-top:16px"><span class="k">Membre depuis</span><span id="dSince"></span></div>
         <div class="dl-row"><span class="k">Rôle</span><span id="dRole"></span></div>
         <div class="dl-row"><span class="k">Version du jeu</span><span id="dVer"></span></div>
+        <a class="btn ghost small" id="dProfile" style="width:100%;margin-top:14px;display:none">VOIR MA FICHE PUBLIQUE ↗</a>
+      </div>
+      <div class="card mt">
+        <h3>STATISTIQUES</h3>
+        <div id="dStats"><div class="empty">…</div></div>
       </div>
       <div class="card mt">
         <h3>PROFIL</h3>
@@ -66,6 +71,7 @@
       </div>
       <div class="card mt">
         <h3>ACTIONS</h3>
+        <button class="btn ghost small" id="btnVerify" style="width:100%;margin-bottom:10px;display:none">RENVOYER L'E-MAIL DE VÉRIFICATION</button>
         <button class="btn ghost small" id="btnLogout" style="width:100%;margin-bottom:10px">SE DÉCONNECTER</button>
         <button class="btn danger small" id="btnReset" style="width:100%">RÉINITIALISER LE MOT DE PASSE</button>
       </div>
@@ -121,7 +127,7 @@
 
 </main>
 <footer class="site"><div class="wrap">
-  <div class="fl">TESSERACT STUDIO</div><p>© <span id="yr"></span></p>
+  <div class="fl">KAELORYN STUDIO</div><p>© <span id="yr"></span></p>
 </div></footer>
 
 <script type="module">
@@ -139,8 +145,8 @@ function show(which) {
 function authMode(m) {
   mode = m;
   $('authtitle').textContent = m === 'login' ? 'CONNEXION' : 'CRÉATION DE COMPTE';
-  $('authsub').textContent = m === 'login' ? 'Accédez à votre espace de Tesseractien.'
-    : 'Rejoignez la guilde des Tesseractiens.';
+  $('authsub').textContent = m === 'login' ? 'Accédez à votre espace de Kaelorien.'
+    : 'Rejoignez la guilde des Kaeloriens.';
   $('authbtn').textContent = m === 'login' ? 'SE CONNECTER' : 'CRÉER MON COMPTE';
   $('lbPseudo').classList.toggle('hidden', m !== 'register');
   $('fPseudo').classList.toggle('hidden', m !== 'register');
@@ -164,7 +170,10 @@ $('authform').addEventListener('submit', async e => {
   try {
     const d = await api('/api/' + mode, { method: 'POST', body });
     setMe(d.user);
-    if (mode === 'register') toast('Compte créé ! Vérifiez votre e-mail.');
+    if (mode === 'register') {
+      toast('Compte créé ! Vérifiez votre e-mail.');
+      if (d.verifyToken) toast('dev: /account.html?verify=' + d.verifyToken, 12000);
+    }
     location.reload();
   } catch (err) { $('autherr').textContent = err.message; }
 });
@@ -195,6 +204,7 @@ async function loadDash(u) {
   if (!u.avatar) { $('dAvatar').className = 'avatar ph'; $('dAvatar').textContent = u.pseudo[0].toUpperCase(); }
   $('dVerified').textContent = u.verified ? '✔ E-MAIL VÉRIFIÉ' : 'E-MAIL NON VÉRIFIÉ';
   $('dVerified').className = 'badge ' + (u.verified ? 'green' : 'red');
+  $('btnVerify').style.display = u.verified ? 'none' : 'block';
   $('dSince').textContent = fmtDate(u.created_at);
   $('dRole').textContent = u.role === 'admin' ? '👑 Administrateur' : 'Aventurier';
   $('pPseudo').value = u.pseudo;
@@ -212,6 +222,26 @@ async function loadDash(u) {
       `<div class="dl-row"><span class="k">${esc(n.title)}</span><span>${fmtDate(n.created_at)}</span></div>`).join('')
       || '<div class="empty">Aucune actualité.</div>';
   } catch (e) {}
+  // statistiques de jeu (progression synchronisée)
+  try {
+    const d = await api('/api/player/' + encodeURIComponent(u.pseudo));
+    const p = d.player, fmt = n => (n || 0).toLocaleString('fr-FR');
+    const h = Math.floor((p.playtime || 0) / 3600), m = Math.floor(((p.playtime || 0) % 3600) / 60);
+    const pt = p.playtime >= 3600 ? `${h}h ${String(m).padStart(2, '0')}` : `${m} min`;
+    $('dStats').innerHTML = `
+      <div class="dl-row"><span class="k">Score</span><span>${fmt(p.score)}</span></div>
+      <div class="dl-row"><span class="k">Rang mondial</span><span>${p.rank ? '#' + p.rank : '—'}</span></div>
+      <div class="dl-row"><span class="k">Niveau</span><span>${p.level}</span></div>
+      <div class="dl-row"><span class="k">Mondes conquis</span><span>${p.worlds_done}/6</span></div>
+      <div class="dl-row"><span class="k">Boss vaincus</span><span>${p.bosses}</span></div>
+      <div class="dl-row"><span class="k">Succès débloqués</span><span>${p.achievements}</span></div>
+      <div class="dl-row"><span class="k">Temps de jeu</span><span>${pt}</span></div>
+      <div class="dl-row"><span class="k">Dernière synchro</span><span>${p.updated_at ? fmtDate(p.updated_at) : '—'}</span></div>`;
+    $('dProfile').href = '/joueur/' + encodeURIComponent(p.pseudo);
+    $('dProfile').style.display = 'block';
+  } catch (e) {
+    $('dStats').innerHTML = '<div class="empty">Aucune progression synchronisée.<br>Jouez en ligne et synchronisez depuis le jeu.</div>';
+  }
 }
 $('pSave').addEventListener('click', async () => {
   $('pMsg').textContent = '';
@@ -230,6 +260,13 @@ $('pSave').addEventListener('click', async () => {
     setTimeout(() => location.reload(), 800);
   } catch (err) { $('pMsg').textContent = err.message; $('pMsg').style.color = 'var(--danger)'; }
 });
+$('btnVerify').addEventListener('click', async () => {
+  try {
+    const d = await api('/api/resend-verify', { method: 'POST', body: {} });
+    toast('E-mail de vérification renvoyé ✔');
+    if (d.devToken) toast('dev: /account.html?verify=' + d.devToken, 8000);
+  } catch (e) { toast(e.message); }
+});
 $('btnLogout').addEventListener('click', async () => { await api('/api/logout', { method: 'POST' }); setMe(null); location.href = '/'; });
 $('btnReset').addEventListener('click', async () => {
   const email = prompt('Votre e-mail de compte :'); if (!email) return;
@@ -238,6 +275,13 @@ $('btnReset').addEventListener('click', async () => {
 });
 
 // ---------- route ----------
+// le lien ?verify= fonctionne connecté OU non connecté
+if (qs.get('verify')) {
+  try { await api('/api/verify?token=' + qs.get('verify')); toast('E-mail vérifié ✔'); }
+  catch (e) { toast('Lien de vérification invalide ou expiré'); }
+  history.replaceState({}, '', '/account.html');
+  qs.delete('verify');
+}
 const u = await me();
 if (qs.get('reset')) {
   $('rToken').value = qs.get('reset'); show('resetview');
@@ -245,10 +289,6 @@ if (qs.get('reset')) {
   show('dashview'); loadDash(u);
 } else {
   show('authview');
-  if (qs.get('verify')) {
-    try { await api('/api/verify?token=' + qs.get('verify')); toast('E-mail vérifié ✔'); } catch (e) {}
-    history.replaceState({}, '', '/account.html');
-  }
   authMode('login');
 }
 mountChrome('/account.html');
